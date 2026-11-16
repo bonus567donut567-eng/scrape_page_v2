@@ -10,7 +10,8 @@ SCHEMA_VERSION = 2
 REACTION_PARSER_VERSION = 2
 DEFAULT_WATCH_DAYS = 7
 DEFAULT_ANCHOR_COUNT = 10
-PERMANENT_STATUSES = {"submitted", "legacy_submitted"}
+DEFAULT_WATCH_LIMIT_PER_PAGE = 50
+PERMANENT_STATUSES = {"submitted", "legacy_submitted", "reaction_unavailable"}
 RECHECK_STATUSES = {"watching", "retry"}
 
 
@@ -59,6 +60,15 @@ def load_page_state(path: str | Path, legacy_success_ids: set[str] | None = None
                 record.pop("reaction_source", None)
                 record.pop("expired_at", None)
                 record["parser_invalidated_at"] = _time_text()
+    for page in value["pages"].values():
+        for record in page.get("posts", {}).values():
+            if (
+                record.get("status") == "retry"
+                and record.get("reaction_count") is None
+                and record.get("last_error") == "reaction_count_unavailable"
+            ):
+                record["status"] = "reaction_unavailable"
+                record["skipped_at"] = _time_text()
     merged = {
         str(item) for item in value.get("legacy_submitted_ids", []) if str(item).strip()
     }
@@ -130,6 +140,7 @@ def due_watch_items(
     *,
     now: datetime | None = None,
     watch_days: int = DEFAULT_WATCH_DAYS,
+    limit_per_page: int = DEFAULT_WATCH_LIMIT_PER_PAGE
 ) -> list[dict[str, str]]:
     current = now or _now()
     cutoff = current - timedelta(days=max(1, watch_days))
@@ -162,7 +173,7 @@ def due_watch_items(
             ),
             reverse=True,
         )
-        for post_id, record in page_candidates:
+        for post_id, record in page_candidates[:max(1, limit_per_page)]:
             url = str(record.get("url", ""))
             items.append({
                 "post_id": post_id,
@@ -219,6 +230,9 @@ def update_post_result(
     if result.get("status") == "success":
         record["status"] = "scraped"
         record["scraped_at"] = _time_text(current)
+    elif result.get("error") == "reaction_count_unavailable":
+        record["status"] = "reaction_unavailable"
+        record["skipped_at"] = _time_text(current)
     elif result.get("reaction_count") is None:
         record["status"] = "retry"
     else:

@@ -172,6 +172,35 @@ class PageStateTests(unittest.TestCase):
             self.assertEqual(posts["sent"]["status"], "submitted")
             self.assertEqual(posts["sent"]["reaction_count"], 2000)
 
+    def test_load_migrates_old_unavailable_retry_to_permanent_skip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            save_json(path, {
+                "schema_version": page_state.SCHEMA_VERSION,
+                "reaction_parser_version": page_state.REACTION_PARSER_VERSION,
+                "legacy_submitted_ids": [],
+                "pages": {
+                    "page": {
+                        "anchors": [],
+                        "posts": {
+                            "100": {
+                                "status": "retry",
+                                "reaction_count": None,
+                                "last_error": "reaction_count_unavailable",
+                                "url": "https://facebook.com/photo/?fbid=100",
+                            },
+                        },
+                    },
+                },
+            })
+
+            state = page_state.load_page_state(path)
+
+            self.assertEqual(
+                state["pages"]["page"]["posts"]["100"]["status"],
+                "reaction_unavailable",
+            )
+            self.assertEqual(page_state.permanent_ids(state), {"100"})
     def test_watchlist_rechecks_then_expires_known_low_reaction(self):
         now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
         page_url = "https://facebook.com/example"
@@ -200,7 +229,7 @@ class PageStateTests(unittest.TestCase):
         )
         self.assertEqual(state["pages"][page_url]["posts"]["100"]["status"], "expired")
 
-    def test_unavailable_reaction_never_expires_and_submitted_is_permanent(self):
+    def test_unavailable_reaction_is_skipped_permanently(self):
         now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
         page_url = "https://facebook.com/example"
         item = {
@@ -220,11 +249,29 @@ class PageStateTests(unittest.TestCase):
             },
             now=now - timedelta(days=30),
         )
-        self.assertEqual(len(page_state.due_watch_items(state, [page_url], now=now)), 1)
-        page_state.mark_submitted(state, {"100"}, now=now)
-        self.assertEqual(page_state.permanent_ids(state), {"100"})
         self.assertEqual(page_state.due_watch_items(state, [page_url], now=now), [])
+        self.assertEqual(
+            state["pages"][page_url]["posts"]["100"]["status"],
+            "reaction_unavailable",
+        )
+        self.assertEqual(page_state.permanent_ids(state), {"100"})
 
+    def test_watchlist_cap_keeps_newest_candidates_per_page(self):
+        now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+        page_url = "https://facebook.com/example"
+        state = page_state.new_state()
+        for index in range(1, 4):
+            page_state.register_discovered(state, [{
+                "post_id": str(index),
+                "url": f"https://facebook.com/photo/?fbid={index}",
+                "source_page_url": page_url,
+            }], now=now - timedelta(minutes=4 - index))
+
+        items = page_state.due_watch_items(
+            state, [page_url], now=now, limit_per_page=2,
+        )
+
+        self.assertEqual([item["post_id"] for item in items], ["3", "2"])
     def test_anchors_update_only_after_clean_collection(self):
         state = page_state.new_state()
         page_state.update_anchors(state, {
@@ -234,6 +281,31 @@ class PageStateTests(unittest.TestCase):
         self.assertEqual(state["pages"]["good"]["anchors"], ["3", "2", "1"])
         self.assertNotIn("blocked", state["pages"])
 
+
+class SharedBrowserTests(unittest.TestCase):
+    def test_comment_collection_reuses_primary_post_driver(self):
+        shared_driver = object()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                post_scraper,
+                "scrape_fb_post_direct",
+                return_value=(True, "caption", ""),
+            ) as primary,
+            patch.object(post_scraper, "scrape_page_comment_images") as comments,
+            patch.object(post_scraper, "init_driver") as init_driver,
+        ):
+            result = post_scraper.scrape_fb_post_with_comments(
+                "https://facebook.com/photo/?fbid=1",
+                str(Path(directory) / "image.jpg"),
+                str(Path(directory) / "comments"),
+                driver=shared_driver,
+            )
+
+        self.assertEqual(result, (True, "caption", ""))
+        self.assertIs(primary.call_args.kwargs["driver"], shared_driver)
+        self.assertIs(comments.call_args.args[0], shared_driver)
+        init_driver.assert_not_called()
 
 class ReactionCountTests(unittest.TestCase):
     def test_parse_reaction_count_formats(self):
@@ -333,6 +405,7 @@ class StoreAndCliTests(unittest.TestCase):
         self.assertEqual(args.max_posts, 20)
         self.assertEqual(args.min_likes, 3000)
         self.assertEqual(args.scan_limit, 200)
+        self.assertEqual(args.watch_limit_per_page, 50)
         self.assertEqual(args.stop_after_seen, 5)
         self.assertFalse(args.retry_all)
         self.assertFalse(args.no_comments)
@@ -400,8 +473,10 @@ class StoreAndCliTests(unittest.TestCase):
                 patch.object(main, "collect_page_links", return_value=items),
                 patch.object(main, "write_post_result", side_effect=outcomes) as writer,
             ):
-                self.assertEqual(main.run(args), 0)
+                self.assertEqual(main.run(args, processing_driver=object()), 0)
             self.assertEqual(writer.call_count, 4)
+            drivers = [call.kwargs["driver"] for call in writer.call_args_list]
+            self.assertTrue(all(driver is drivers[0] for driver in drivers))
             summary = load_json(root / "out" / "latest_run.json", dict)
             self.assertEqual(summary["success_count"], 2)
             self.assertEqual(summary["filtered_count"], 2)
@@ -462,7 +537,7 @@ class StoreAndCliTests(unittest.TestCase):
                 patch.object(main, "collect_page_links", side_effect=fake_collect),
                 patch.object(main, "write_post_result", return_value=outcome),
             ):
-                self.assertEqual(main.run(args), 0)
+                self.assertEqual(main.run(args, processing_driver=object()), 0)
 
             state = load_json(state_path, dict)
             post = state["pages"][page_url]["posts"]["new-1"]
@@ -497,7 +572,7 @@ class StoreAndCliTests(unittest.TestCase):
                 patch.object(main, "collect_page_links", return_value=items),
                 patch.object(main, "write_post_result", return_value=fatal) as writer,
             ):
-                self.assertEqual(main.run(args), 2)
+                self.assertEqual(main.run(args, processing_driver=object()), 2)
             self.assertEqual(writer.call_count, 1)
             summary = load_json(root / "out" / "latest_run.json", dict)
             self.assertTrue(summary["fatal_browser_error"].startswith("browser_startup_failed:"))
@@ -516,12 +591,12 @@ class StoreAndCliTests(unittest.TestCase):
                 "scrape_fb_post_with_comments",
                 return_value=(False, "", "blocked"),
             ):
-                self.assertEqual(main.run(args), 2)
+                self.assertEqual(main.run(args, processing_driver=object()), 2)
             self.assertEqual(load_json(root / "seen.json", list), [])
 
-    def test_main_preflight_failure_stops_before_run(self):
+    def test_main_driver_check_failure_stops_before_run(self):
         with (
-            patch.object(main, "preflight_chrome_runtime", side_effect=RuntimeError("driver unavailable")),
+            patch.object(main, "ensure_local_chromedriver", side_effect=RuntimeError("driver unavailable")),
             patch.object(main, "run") as runner,
         ):
             self.assertEqual(
@@ -540,7 +615,7 @@ class StoreAndCliTests(unittest.TestCase):
             "cleanup_output",
             return_value={"removed_files": 0, "freed_bytes": 0},
         ):
-            self.assertEqual(main.run(args), 0)
+            self.assertEqual(main.run(args, processing_driver=object()), 0)
         submitter.assert_called_once_with(main.DEFAULT_OUTPUT.resolve())
 
 

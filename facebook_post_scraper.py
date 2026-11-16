@@ -1552,10 +1552,18 @@ def scrape_fb_post_direct(
             )
 
     except Exception as e:
-        prefix = "browser_startup_failed: " if owns_driver and driver is None else "เกิดข้อผิดพลาด: "
-        return _caption_result(
-            driver, post_url, False, "", f"{prefix}{str(e)}"
+        message = str(e)
+        session_markers = (
+            "invalid session id", "chrome not reachable", "disconnected",
+            "tab crashed", "no such window", "target window already closed",
         )
+        if owns_driver and driver is None:
+            prefix = "browser_startup_failed: "
+        elif any(marker in message.casefold() for marker in session_markers):
+            prefix = "browser_session_failed: "
+        else:
+            prefix = "เกิดข้อผิดพลาด: "
+        return _caption_result(driver, post_url, False, "", f"{prefix}{message}")
     finally:
         if owns_driver and driver:
             quit_driver_safely(driver)
@@ -1573,44 +1581,35 @@ def scrape_fb_post_with_comments(
     collect_comments: bool = True,
     min_reactions: int = 0,
     metadata: dict | None = None,
+    driver=None,
 ):
-    """
-    ฟังก์ชันนี้จะเรียกใช้ scrape_fb_post_direct ตัวเดิมของคุณแบบ 100% 
-    และหากทำงานสำเร็จ จะเปิดเบราว์เซอร์แบบซ่อนจอ (headless=True) เพื่อกวาดรูปคอมเมนต์อัตโนมัติ
-    """
+    """Scrape the post and owner-comment images with the supplied shared driver."""
     # 1. เรียกใช้ฟังก์ชันเดิมของคุณตรงๆ ก่อน (ดึงภาพหลัก + แคปชั่น)
     success, caption, err_msg = scrape_fb_post_direct(
         post_url,
         save_image_path,
         min_reactions=min_reactions,
         metadata=metadata,
+        driver=driver,
     )
     
-    # 2. ถ้าดึงโพสต์หลักสำเร็จ และมีคำสั่งให้เก็บรูปคอมเมนต์ ค่อยเปิดเบราว์เซอร์รอบสอง
+    # 2. เก็บคอมเมนต์ด้วย session เดิม ไม่เปิด Chrome ซ้ำต่อโพสต์
     if success and collect_comments and save_comment_dir:
-        driver = None
+        comment_driver = driver
+        owns_comment_driver = comment_driver is None
         try:
-            _safe_print("[*] 🌐 กำลังเปิดเบราว์เซอร์เบื้องหลังเพื่อกวาดรูปคอมเมนต์...")
-            # 🔍 ปรับกลับเป็น headless=True เพื่อซ่อนหน้าต่างเบราว์เซอร์ไม่ให้เด้งขึ้นมา
-            driver = init_driver(headless=True)
-            driver.set_window_size(1440, 900)
-            
-            driver.get(post_url)
-            time.sleep(3.0)  # ให้เวลาหน้าเว็บตั้งหลักโหลดสักครู่
-            dismiss_login_popup(driver)
-            
-            # เรียกใช้ฟังก์ชันกวาดรูปคอมเมนต์
+            if comment_driver is None:
+                comment_driver = init_driver(headless=True)
+                comment_driver.get(post_url)
+                time.sleep(1.0)
+                dismiss_login_popup(comment_driver)
             scrape_page_comment_images(
-                driver,
+                comment_driver,
                 save_comment_dir,
                 post_url=post_url,
                 source_page_id=source_page_id,
                 source_page_url=source_page_url,
             )
-            
-            _safe_print("[*] 🏁 กวาดรูปคอมเมนต์เสร็จสิ้น ปิดเบราว์เซอร์ใน 3 วินาที...")
-            time.sleep(3.0)
-            
         except Exception as e:
             output_dir = Path(save_comment_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1623,9 +1622,9 @@ def scrape_fb_post_with_comments(
             })
             _safe_print(f"[!] ข้ามการดึงรูปคอมเมนต์เนื่องจากข้อผิดพลาด: {e}")
         finally:
-            if driver:
-                quit_driver_safely(driver)
-                
+            if owns_comment_driver and comment_driver:
+                quit_driver_safely(comment_driver)
+
     return success, caption, err_msg
 
 def _serializable_identity(identity: dict) -> dict:

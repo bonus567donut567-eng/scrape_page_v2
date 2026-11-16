@@ -12,12 +12,15 @@ from typing import Iterable
 from filelock import FileLock, Timeout
 
 from collector import collect_page_links
-from chrome_profile import preflight_chrome_runtime
-from facebook_post_scraper import COMMENT_MANIFEST_NAME, scrape_fb_post_with_comments
+from chrome_profile import ensure_local_chromedriver
+from facebook_post_scraper import (
+    COMMENT_MANIFEST_NAME, init_driver, quit_driver_safely, scrape_fb_post_with_comments,
+)
 from google_submit import process_pending_submissions
 from json_store import load_json, save_json
 from output_cleanup import cleanup_output
 from page_state import (
+    DEFAULT_WATCH_LIMIT_PER_PAGE,
     anchors_by_page,
     due_watch_items,
     known_ids,
@@ -117,6 +120,7 @@ def write_post_result(
     *,
     collect_comments: bool,
     min_reactions: int = 0,
+    driver=None,
 ) -> dict:
     post_id = str(item["post_id"])
     post_dir = output_root / "posts" / post_id
@@ -135,6 +139,7 @@ def write_post_result(
         collect_comments=collect_comments,
         min_reactions=min_reactions,
         metadata=scrape_metadata,
+        driver=driver,
     )
     caption = str(caption or "").strip()
     error = str(error or "")
@@ -185,7 +190,7 @@ def save_success_ids(history_path: Path, values: set[str]) -> None:
     save_json(history_path, sorted(values))
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, *, processing_driver=None) -> int:
     output_root = Path(args.output).expanduser().resolve()
     history_path = Path(args.history).expanduser().resolve()
     scanned_history_path = Path(args.scanned_history).expanduser().resolve()
@@ -254,6 +259,7 @@ def run(args: argparse.Namespace) -> int:
                 incremental_state,
                 page_urls,
                 watch_days=args.watch_days,
+                limit_per_page=args.watch_limit_per_page
             )
             save_page_state(page_state_path, incremental_state)
         else:
@@ -282,6 +288,7 @@ def run(args: argparse.Namespace) -> int:
         "incremental_state_enabled": use_incremental_state,
         "page_state_path": str(page_state_path) if use_incremental_state else "",
         "watch_days": args.watch_days if use_incremental_state else 0,
+        "watch_limit_per_page": args.watch_limit_per_page if use_incremental_state else 0,
         "anchor_hits_required": args.anchor_hits if use_incremental_state else 0,
         "anchor_tail_posts": args.anchor_tail if use_incremental_state else 0,
         "collection_metadata": collection_metadata,
@@ -291,6 +298,26 @@ def run(args: argparse.Namespace) -> int:
     }
     save_json(run_file, summary)
 
+    owns_processing_driver = False
+    if post_items and processing_driver is None:
+        try:
+            processing_driver = init_driver(headless=True)
+            owns_processing_driver = True
+            safe_print("[*] เปิด Selenium session กลางสำหรับประมวลผลทั้งรอบแล้ว")
+        except Exception as exc:
+            message = f"browser_startup_failed: {type(exc).__name__}: {exc}"
+            summary.update({
+                "finished_at": now_text(),
+                "success_count": 0,
+                "filtered_count": 0,
+                "failed_count": 0,
+                "accepted_per_page": {},
+                "fatal_browser_error": message,
+            })
+            save_json(run_file, summary)
+            save_json(output_root / "latest_run.json", summary)
+            safe_print(f"[x] {message}")
+            return 2
     safe_print(f"\n[*] พบ {len(post_items)} โพสต์ผู้สมัครสำหรับประมวลผล")
     if args.min_likes > 0:
         safe_print(
@@ -313,6 +340,7 @@ def run(args: argparse.Namespace) -> int:
             output_root,
             collect_comments=not args.no_comments,
             min_reactions=args.min_likes,
+            driver=processing_driver,
         )
         record["run_position"] = index
         summary["results"].append(record)
@@ -333,7 +361,9 @@ def run(args: argparse.Namespace) -> int:
             safe_print(f"[-] กรองออก: {post_id} | {detail}")
         else:
             safe_print(f"[!] ไม่สำเร็จ: {post_id} ({record['error']})")
-            if str(record.get("error", "")).startswith("browser_startup_failed:"):
+            if str(record.get("error", "")).startswith((
+                "browser_startup_failed:", "browser_session_failed:",
+            )):
                 fatal_browser_error = str(record["error"])
                 safe_print("[x] เปิด Chrome runtime ไม่ได้ จึงหยุดทันทีเพื่อไม่วนล้มเหลวทั้งคิว")
         if not use_incremental_state and (record["status"] == "success" or (
@@ -346,6 +376,9 @@ def run(args: argparse.Namespace) -> int:
         if fatal_browser_error:
             break
 
+    if owns_processing_driver and processing_driver is not None:
+        quit_driver_safely(processing_driver)
+        processing_driver = None
     summary["finished_at"] = now_text()
     summary["success_count"] = sum(row["status"] == "success" for row in summary["results"])
     summary["filtered_count"] = sum(row["status"] == "filtered" for row in summary["results"])
@@ -438,6 +471,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="จำนวนวันที่ตรวจ Reaction ซ้ำสำหรับโพสต์ที่ยังไม่ผ่านเกณฑ์",
     )
     parser.add_argument(
+        "--watch-limit-per-page", type=int, default=DEFAULT_WATCH_LIMIT_PER_PAGE,
+        help="จำนวนโพสต์ watchlist สูงสุดที่ตรวจต่อเพจในหนึ่งรอบ",
+    )
+    parser.add_argument(
         "--anchor-hits", type=int, default=3,
         help="จำนวน anchor เดิมที่ต้องพบก่อนเริ่มระยะตรวจเผื่อ",
     )
@@ -475,6 +512,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--stop-after-seen ต้องอยู่ระหว่าง 1 ถึง 100")
     if not 1 <= args.watch_days <= 90:
         parser.error("--watch-days ต้องอยู่ระหว่าง 1 ถึง 90")
+    if not 1 <= args.watch_limit_per_page <= 500:
+        parser.error("--watch-limit-per-page ต้องอยู่ระหว่าง 1 ถึง 500")
     if not 1 <= args.anchor_hits <= 10:
         parser.error("--anchor-hits ต้องอยู่ระหว่าง 1 ถึง 10")
     if not 0 <= args.anchor_tail <= 200:
@@ -492,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         with FileLock(str(lock_path)).acquire(timeout=0):
             if not args.submit_only:
                 try:
-                    preflight_chrome_runtime()
+                    ensure_local_chromedriver()
                 except Exception as exc:
                     safe_print(
                         f"[x] browser_startup_failed: {type(exc).__name__}: {exc}"
