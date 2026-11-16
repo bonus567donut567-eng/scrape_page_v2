@@ -408,7 +408,7 @@ class StoreAndCliTests(unittest.TestCase):
         self.assertEqual(args.watch_limit_per_page, 50)
         self.assertEqual(args.stop_after_seen, 5)
         self.assertFalse(args.retry_all)
-        self.assertFalse(args.no_comments)
+        self.assertTrue(args.no_comments)
         self.assertFalse(args.no_submit)
 
     def test_cli_validates_max_posts(self):
@@ -438,6 +438,27 @@ class StoreAndCliTests(unittest.TestCase):
             self.assertEqual(record["reaction_count"], 1000)
             self.assertFalse((root / "posts" / "123").exists())
 
+    def test_failed_scrape_removes_partial_payload_immediately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def fake_scrape(_url, image_path, *_args, **_kwargs):
+                image = Path(image_path)
+                image.parent.mkdir(parents=True, exist_ok=True)
+                image.write_bytes(b"partial")
+                return False, "", "blocked"
+
+            with patch.object(main, "scrape_fb_post_with_comments", side_effect=fake_scrape):
+                record = main.write_post_result(
+                    {"post_id": "failed-1", "url": "https://facebook.com/photo/?fbid=failed-1"},
+                    root,
+                    collect_comments=False,
+                )
+
+            post_dir = root / "posts" / "failed-1"
+            self.assertEqual(record["status"], "failed")
+            self.assertTrue((post_dir / "post.json").is_file())
+            self.assertFalse((post_dir / "image.jpg").exists())
     def test_run_scans_in_order_until_target_count_is_reached(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -728,7 +749,7 @@ class GoogleSubmissionQueueTests(unittest.TestCase):
             (post_dir / "submitted.flag").write_text("submitted\n", encoding="utf-8")
             self.assertTrue(google_submit.append_post(post_dir))
 
-    def test_failed_submission_retries_once_then_becomes_terminal(self):
+    def test_failed_submission_is_kept_for_next_run(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             post_dir = output / "posts" / "100"
@@ -746,14 +767,15 @@ class GoogleSubmissionQueueTests(unittest.TestCase):
                     post_dir / google_submit.SUBMISSION_STATE, dict
                 )
 
-            self.assertEqual(result["terminal_failed_post_ids"], ["100"])
+            self.assertEqual(result["terminal_failed_post_ids"], [])
+            self.assertEqual(result["retry_pending_post_ids"], ["100"])
             self.assertEqual(state["attempt_count"], 2)
-            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["status"], "retry_pending")
             self.assertNotIn("delete_after", state)
             self.assertEqual(append.call_count, 2)
             sleep.assert_called_once_with(20)
-            self.assertFalse((post_dir / "image.jpg").exists())
-            self.assertFalse((post_dir / "caption.txt").exists())
+            self.assertTrue((post_dir / "image.jpg").is_file())
+            self.assertTrue((post_dir / "caption.txt").is_file())
 
 
 class ChromeProfileTests(unittest.TestCase):
@@ -835,34 +857,29 @@ class OutputCleanupTests(unittest.TestCase):
             self.assertFalse(old.exists())
             self.assertTrue(fresh.exists())
 
-    def test_cleanup_removes_terminal_failure_media_immediately(self):
+    def test_cleanup_removes_only_incomplete_scrape_media(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            failed = output / "posts" / "failed"
-            retry = output / "posts" / "retry"
-            for post_dir in (failed, retry):
+            incomplete = output / "posts" / "incomplete"
+            submit_failed = output / "posts" / "submit-failed"
+            for post_dir in (incomplete, submit_failed):
                 post_dir.mkdir(parents=True)
-                (post_dir / "post.json").write_text('{"status":"success"}', encoding="utf-8")
                 (post_dir / "caption.txt").write_text("caption", encoding="utf-8")
                 (post_dir / "image.jpg").write_bytes(b"image")
-
-            save_json(failed / "submission_state.json", {
-                "status": "failed",
+            (incomplete / "post.json").write_text('{"status":"failed"}', encoding="utf-8")
+            (submit_failed / "post.json").write_text('{"status":"success"}', encoding="utf-8")
+            save_json(submit_failed / "submission_state.json", {
+                "status": "retry_pending",
                 "attempt_count": 2,
             })
-            save_json(retry / "submission_state.json", {
-                "status": "retry_pending",
-                "attempt_count": 1,
-            })
 
-            stats = output_cleanup.cleanup_failed_post_media_all(output)
+            stats = output_cleanup.cleanup_output(output)
 
-            self.assertEqual(stats["posts_cleaned"], 1)
-            self.assertTrue(failed.is_dir())
-            self.assertFalse((failed / "image.jpg").exists())
-            self.assertFalse((failed / "caption.txt").exists())
-            self.assertTrue(retry.is_dir())
-            self.assertTrue((retry / "image.jpg").is_file())
+            self.assertEqual(stats["incomplete_scrapes"]["posts_cleaned"], 1)
+            self.assertFalse((incomplete / "image.jpg").exists())
+            self.assertFalse((incomplete / "caption.txt").exists())
+            self.assertTrue((submit_failed / "image.jpg").is_file())
+            self.assertTrue((submit_failed / "caption.txt").is_file())
 
 
 if __name__ == "__main__":

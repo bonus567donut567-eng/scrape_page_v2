@@ -8,7 +8,7 @@ from pathlib import Path
 import google_auth
 import google_config
 from json_store import load_json, save_json
-from output_cleanup import cleanup_failed_post_media, cleanup_submitted_post
+from output_cleanup import cleanup_submitted_post
 
 SUBMITTED_FLAG = "submitted.flag"
 SUBMISSION_STATE = "submission_state.json"
@@ -118,13 +118,6 @@ def _attempt_count(state: dict) -> int:
         return 0
 
 
-def _is_terminal_failure(post_dir: Path) -> bool:
-    state = _submission_state(post_dir)
-    return (
-        state.get("status") == "failed"
-        and _attempt_count(state) >= MAX_SUBMISSION_ATTEMPTS
-    )
-
 
 def _record_submission_failure(post_dir: Path) -> dict:
     state = _submission_state(post_dir)
@@ -135,10 +128,7 @@ def _record_submission_failure(post_dir: Path) -> dict:
         "first_failed_at": state.get("first_failed_at") or now.isoformat(timespec="seconds"),
         "last_failed_at": now.isoformat(timespec="seconds"),
     })
-    if attempt_count >= MAX_SUBMISSION_ATTEMPTS:
-        state["status"] = "failed"
-    else:
-        state["status"] = "retry_pending"
+    state["status"] = "retry_pending"
     state.pop("delete_after", None)
     save_json(post_dir / SUBMISSION_STATE, state)
     return state
@@ -234,7 +224,6 @@ def process_pending_submissions(
                 and (directory / "caption.txt").is_file()
                 and _find_image(directory) is not None
                 and not (directory / SUBMITTED_FLAG).is_file()
-                and not _is_terminal_failure(directory)
             ),
             key=lambda path: (path.stat().st_mtime, path.name),
         )
@@ -244,8 +233,7 @@ def process_pending_submissions(
     terminal_failed: list[str] = []
     for index, directory in enumerate(pending, start=1):
         print(f"[*] ส่ง Google Sheets {index}/{len(pending)} post_id={directory.name}")
-        while _attempt_count(_submission_state(directory)) < MAX_SUBMISSION_ATTEMPTS:
-            attempt_number = _attempt_count(_submission_state(directory)) + 1
+        for attempt_number in range(1, MAX_SUBMISSION_ATTEMPTS + 1):
             if append_post(directory):
                 submitted.append(directory.name)
                 cleanup = cleanup_submitted_post(directory)
@@ -254,18 +242,8 @@ def process_pending_submissions(
                     f"ลบไฟล์ในเครื่อง {cleanup['removed_files']} ไฟล์"
                 )
                 break
-            state = _record_submission_failure(directory)
-            if state["status"] == "failed":
-                failed.append(directory.name)
-                terminal_failed.append(directory.name)
-                cleanup = cleanup_failed_post_media(directory)
-                print(
-                    f"[x] ส่งไม่สำเร็จครบ {MAX_SUBMISSION_ATTEMPTS} ครั้ง "
-                    f"post_id={directory.name} | "
-                    f"ลบรูปและ caption {cleanup['removed_files']} ไฟล์แล้ว"
-                )
-                break
-            else:
+            _record_submission_failure(directory)
+            if attempt_number < MAX_SUBMISSION_ATTEMPTS:
                 print(
                     f"[!] ส่งไม่สำเร็จครั้งที่ {attempt_number}/"
                     f"{MAX_SUBMISSION_ATTEMPTS} post_id={directory.name} | "
@@ -273,6 +251,13 @@ def process_pending_submissions(
                 )
                 if retry_delay_seconds > 0:
                     time.sleep(retry_delay_seconds)
+            else:
+                failed.append(directory.name)
+                retry_pending.append(directory.name)
+                print(
+                    f"[!] ส่งไม่สำเร็จครบ {MAX_SUBMISSION_ATTEMPTS} ครั้งในรอบนี้ "
+                    f"post_id={directory.name} | เก็บไฟล์ไว้ลองใหม่รอบถัดไป"
+                )
     return {
         "total": len(pending),
         "submitted": len(submitted),

@@ -18,7 +18,7 @@ from facebook_post_scraper import (
 )
 from google_submit import process_pending_submissions
 from json_store import load_json, save_json
-from output_cleanup import cleanup_output
+from output_cleanup import cleanup_incomplete_post, cleanup_output
 from page_state import (
     DEFAULT_WATCH_LIMIT_PER_PAGE,
     anchors_by_page,
@@ -176,6 +176,8 @@ def write_post_result(
     }
     if status != "filtered":
         save_json(post_dir / "post.json", record)
+    if not success:
+        cleanup_incomplete_post(post_dir)
     return record
 
 
@@ -449,7 +451,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-scrolls", type=int, default=80, help="จำนวนรอบเลื่อนสูงสุดต่อเพจ")
     parser.add_argument("--headed", action="store_true", help="แสดงหน้าต่าง browser ตอนกวาดหน้าเพจ")
-    parser.add_argument("--no-comments", action="store_true", help="ไม่ดึงภาพจากคอมเมนต์ของเจ้าของเพจ")
+    parser.add_argument("--no-comments", action="store_true", default=True, help=argparse.SUPPRESS)
     parser.add_argument(
         "--no-submit", action="store_true",
         help="ดึงและบันทึกไฟล์อย่างเดียว ไม่ส่ง Google Drive/Sheets",
@@ -501,7 +503,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.min_likes = 3000
         args.scan_limit = 200
         args.stop_after_seen = 5
-        args.no_comments = False
+        args.no_comments = True
     if not 1 <= args.max_posts <= 500:
         parser.error("--max-posts ต้องอยู่ระหว่าง 1 ถึง 500")
     if args.min_likes < 0:

@@ -9,7 +9,6 @@ from json_store import load_json
 
 
 SUBMITTED_FLAG = "submitted.flag"
-SUBMISSION_STATE = "submission_state.json"
 MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".img"}
 DEFAULT_DEBUG_RETENTION_DAYS = 7
 DEFAULT_RUN_HISTORY_LIMIT = 30
@@ -71,12 +70,9 @@ def cleanup_submitted_post(post_directory: str | Path) -> dict:
     return _cleanup_post_payload(post_dir, include_caption=True)
 
 
-def cleanup_failed_post_media(post_directory: str | Path) -> dict:
-    """Delete caption and images after a post reaches terminal failure."""
+def cleanup_incomplete_post(post_directory: str | Path) -> dict:
+    """Delete partial payload from a scrape that did not complete successfully."""
     post_dir = Path(post_directory).resolve()
-    state = load_json(post_dir / SUBMISSION_STATE, dict)
-    if not isinstance(state, dict) or state.get("status") != "failed":
-        return {"removed_files": 0, "freed_bytes": 0, "errors": []}
     return _cleanup_post_payload(post_dir, include_caption=True)
 
 
@@ -105,11 +101,11 @@ def cleanup_submitted_posts(output_root: str | Path) -> dict:
     return stats
 
 
-def cleanup_failed_post_media_all(output_root: str | Path) -> dict:
-    """Sweep caption/media for terminal failures; keep metadata and state."""
+def cleanup_incomplete_scrapes(output_root: str | Path) -> dict:
+    """Sweep partial payloads belonging to failed scrape records only."""
     posts_root = Path(output_root).resolve() / "posts"
     stats = {
-        "failed_posts_checked": 0,
+        "incomplete_posts_checked": 0,
         "posts_cleaned": 0,
         "removed_files": 0,
         "freed_bytes": 0,
@@ -118,11 +114,11 @@ def cleanup_failed_post_media_all(output_root: str | Path) -> dict:
     if not posts_root.is_dir():
         return stats
     for post_dir in posts_root.iterdir():
-        state = load_json(post_dir / SUBMISSION_STATE, dict)
-        if not isinstance(state, dict) or state.get("status") != "failed":
+        record = load_json(post_dir / "post.json", dict)
+        if not isinstance(record, dict) or record.get("status") == "success":
             continue
-        stats["failed_posts_checked"] += 1
-        result = cleanup_failed_post_media(post_dir)
+        stats["incomplete_posts_checked"] += 1
+        result = cleanup_incomplete_post(post_dir)
         stats["removed_files"] += result["removed_files"]
         stats["freed_bytes"] += result["freed_bytes"]
         stats["errors"].extend(result["errors"])
@@ -193,29 +189,29 @@ def cleanup_output(
     run_history_limit: int = DEFAULT_RUN_HISTORY_LIMIT,
 ) -> dict:
     submitted = cleanup_submitted_posts(output_root)
-    failed = cleanup_failed_post_media_all(output_root)
+    incomplete = cleanup_incomplete_scrapes(output_root)
     debug = cleanup_debug_files(output_root, debug_retention_days)
     runs = cleanup_run_history(output_root, run_history_limit)
     return {
         "submitted_posts": submitted,
-        "failed_posts": failed,
+        "incomplete_scrapes": incomplete,
         "debug": debug,
         "runs": runs,
         "removed_files": (
             submitted["removed_files"]
-            + failed["removed_files"]
+            + incomplete["removed_files"]
             + debug["removed_files"]
             + runs["removed_files"]
         ),
         "freed_bytes": (
             submitted["freed_bytes"]
-            + failed["freed_bytes"]
+            + incomplete["freed_bytes"]
             + debug["freed_bytes"]
             + runs["freed_bytes"]
         ),
         "errors": [
             *submitted["errors"],
-            *failed["errors"],
+            *incomplete["errors"],
             *debug["errors"],
             *runs["errors"],
         ],
