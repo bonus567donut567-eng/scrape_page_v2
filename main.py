@@ -12,6 +12,7 @@ from typing import Iterable
 from filelock import FileLock, Timeout
 
 from collector import collect_page_links
+from chrome_profile import preflight_chrome_runtime
 from facebook_post_scraper import COMMENT_MANIFEST_NAME, scrape_fb_post_with_comments
 from google_submit import process_pending_submissions
 from json_store import load_json, save_json
@@ -297,6 +298,7 @@ def run(args: argparse.Namespace) -> int:
             f"เป้าหมาย {args.max_posts} โพสต์ต่อเพจ"
         )
     accepted_per_page: dict[str, int] = {}
+    fatal_browser_error = ""
     for index, item in enumerate(post_items, start=1):
         page_key = str(item.get("page_sequence") or item.get("source_page_url") or "single")
         if accepted_per_page.get(page_key, 0) >= args.max_posts:
@@ -331,6 +333,9 @@ def run(args: argparse.Namespace) -> int:
             safe_print(f"[-] กรองออก: {post_id} | {detail}")
         else:
             safe_print(f"[!] ไม่สำเร็จ: {post_id} ({record['error']})")
+            if str(record.get("error", "")).startswith("browser_startup_failed:"):
+                fatal_browser_error = str(record["error"])
+                safe_print("[x] เปิด Chrome runtime ไม่ได้ จึงหยุดทันทีเพื่อไม่วนล้มเหลวทั้งคิว")
         if not use_incremental_state and (record["status"] == "success" or (
             record["status"] == "filtered" and record.get("reaction_count") is not None
         )):
@@ -338,12 +343,15 @@ def run(args: argparse.Namespace) -> int:
             save_success_ids(scanned_history_path, scanned_ids)
         save_json(run_file, summary)
         save_json(output_root / "latest_run.json", summary)
+        if fatal_browser_error:
+            break
 
     summary["finished_at"] = now_text()
     summary["success_count"] = sum(row["status"] == "success" for row in summary["results"])
     summary["filtered_count"] = sum(row["status"] == "filtered" for row in summary["results"])
     summary["failed_count"] = sum(row["status"] == "failed" for row in summary["results"])
     summary["accepted_per_page"] = accepted_per_page
+    summary["fatal_browser_error"] = fatal_browser_error
     if args.no_submit:
         submission_stats = {
             "enabled": False,
@@ -482,6 +490,14 @@ def main(argv: list[str] | None = None) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(lock_path)).acquire(timeout=0):
+            if not args.submit_only:
+                try:
+                    preflight_chrome_runtime()
+                except Exception as exc:
+                    safe_print(
+                        f"[x] browser_startup_failed: {type(exc).__name__}: {exc}"
+                    )
+                    return 2
             return run(args)
     except Timeout:
         safe_print("[!] Scraper กำลังทำงานอยู่แล้ว จึงไม่เปิดซ้ำ")

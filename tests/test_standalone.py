@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import chrome_profile
 import collector
 import facebook_post_scraper as post_scraper
 import google_submit
@@ -470,6 +471,36 @@ class StoreAndCliTests(unittest.TestCase):
             self.assertEqual(state["pages"][page_url]["anchors"], ["new-1", "sent-1"])
             self.assertEqual(load_json(root / "scanned.json", list), ["poisoned-1", "poisoned-2"])
 
+    def test_fatal_browser_startup_failure_stops_after_first_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = main.parse_args([
+                "--url", "example",
+                "--retry-all",
+                "--no-comments",
+                "--no-submit",
+                "--output", str(root / "out"),
+                "--history", str(root / "seen.json"),
+                "--scanned-history", str(root / "scanned.json"),
+            ])
+            items = [
+                {"post_id": "1", "url": "https://facebook.com/photo/?fbid=1"},
+                {"post_id": "2", "url": "https://facebook.com/photo/?fbid=2"},
+            ]
+            fatal = {
+                "post_id": "1",
+                "status": "failed",
+                "error": "browser_startup_failed: driver missing",
+                "reaction_count": None,
+            }
+            with (
+                patch.object(main, "collect_page_links", return_value=items),
+                patch.object(main, "write_post_result", return_value=fatal) as writer,
+            ):
+                self.assertEqual(main.run(args), 2)
+            self.assertEqual(writer.call_count, 1)
+            summary = load_json(root / "out" / "latest_run.json", dict)
+            self.assertTrue(summary["fatal_browser_error"].startswith("browser_startup_failed:"))
     def test_failed_scrape_is_not_added_to_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -488,6 +519,16 @@ class StoreAndCliTests(unittest.TestCase):
                 self.assertEqual(main.run(args), 2)
             self.assertEqual(load_json(root / "seen.json", list), [])
 
+    def test_main_preflight_failure_stops_before_run(self):
+        with (
+            patch.object(main, "preflight_chrome_runtime", side_effect=RuntimeError("driver unavailable")),
+            patch.object(main, "run") as runner,
+        ):
+            self.assertEqual(
+                main.main(["--post-url", "https://facebook.com/photo/?fbid=123"]),
+                2,
+            )
+        runner.assert_not_called()
     def test_submit_only_does_not_require_page_url(self):
         args = main.parse_args(["--submit-only"])
         with patch.object(
@@ -580,7 +621,7 @@ class GoogleSubmissionQueueTests(unittest.TestCase):
             submitted = output / "posts" / "200"
             for post_dir in (pending, submitted):
                 post_dir.mkdir(parents=True)
-                (post_dir / "post.json").write_text("{}", encoding="utf-8")
+                (post_dir / "post.json").write_text('{"status":"success"}', encoding="utf-8")
                 (post_dir / "caption.txt").write_text("caption", encoding="utf-8")
                 (post_dir / "image.jpg").write_bytes(b"image")
             (submitted / "submitted.flag").write_text("submitted\n", encoding="utf-8")
@@ -592,6 +633,20 @@ class GoogleSubmissionQueueTests(unittest.TestCase):
             self.assertEqual(stats["submitted_post_ids"], ["100"])
             append.assert_called_once_with(pending)
 
+    def test_pending_queue_skips_failed_scrape_even_with_partial_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            failed = output / "posts" / "100"
+            failed.mkdir(parents=True)
+            (failed / "post.json").write_text('{"status":"failed"}', encoding="utf-8")
+            (failed / "caption.txt").write_text("partial", encoding="utf-8")
+            (failed / "image.jpg").write_bytes(b"partial")
+
+            with patch.object(google_submit, "append_post") as append:
+                stats = google_submit.process_pending_submissions(output)
+
+            self.assertEqual(stats["total"], 0)
+            append.assert_not_called()
     def test_append_post_with_flag_is_idempotent_without_api(self):
         with tempfile.TemporaryDirectory() as directory:
             post_dir = Path(directory)
@@ -603,7 +658,7 @@ class GoogleSubmissionQueueTests(unittest.TestCase):
             output = Path(directory)
             post_dir = output / "posts" / "100"
             post_dir.mkdir(parents=True)
-            (post_dir / "post.json").write_text("{}", encoding="utf-8")
+            (post_dir / "post.json").write_text('{"status":"success"}', encoding="utf-8")
             (post_dir / "caption.txt").write_text("caption", encoding="utf-8")
             (post_dir / "image.jpg").write_bytes(b"image")
 
@@ -626,6 +681,23 @@ class GoogleSubmissionQueueTests(unittest.TestCase):
             self.assertFalse((post_dir / "caption.txt").exists())
 
 
+class ChromeProfileTests(unittest.TestCase):
+    def test_cache_cleanup_preserves_login_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory)
+            cache = profile / "Default" / "Cache"
+            cookies = profile / "Default" / "Network" / "Cookies"
+            cache.mkdir(parents=True)
+            cookies.parent.mkdir(parents=True, exist_ok=True)
+            (cache / "item.bin").write_bytes(b"cache")
+            cookies.write_bytes(b"login")
+
+            freed = chrome_profile.clean_profile_caches(profile)
+
+            self.assertGreater(freed, 0)
+            self.assertFalse(cache.exists())
+            self.assertEqual(cookies.read_bytes(), b"login")
+
 class OutputCleanupTests(unittest.TestCase):
     def test_cleanup_removes_only_submitted_payloads(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -635,7 +707,7 @@ class OutputCleanupTests(unittest.TestCase):
             for post_dir in (submitted, pending):
                 comments = post_dir / "comments"
                 comments.mkdir(parents=True)
-                (post_dir / "post.json").write_text("{}", encoding="utf-8")
+                (post_dir / "post.json").write_text('{"status":"success"}', encoding="utf-8")
                 (post_dir / "caption.txt").write_text("caption", encoding="utf-8")
                 (post_dir / "image.jpg").write_bytes(b"image")
                 (comments / "comment_001.jpg").write_bytes(b"comment")
@@ -695,7 +767,7 @@ class OutputCleanupTests(unittest.TestCase):
             retry = output / "posts" / "retry"
             for post_dir in (failed, retry):
                 post_dir.mkdir(parents=True)
-                (post_dir / "post.json").write_text("{}", encoding="utf-8")
+                (post_dir / "post.json").write_text('{"status":"success"}', encoding="utf-8")
                 (post_dir / "caption.txt").write_text("caption", encoding="utf-8")
                 (post_dir / "image.jpg").write_bytes(b"image")
 

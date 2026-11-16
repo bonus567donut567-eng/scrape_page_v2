@@ -1,4 +1,4 @@
-"""Collect public photo-post links from Facebook Pages without a login profile."""
+"""Collect photo-post links using the scraper dedicated Chrome profile."""
 from __future__ import annotations
 
 import random
@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import Page, sync_playwright
 
 from browser_runtime import chromium_launch_options
+from chrome_profile import PROFILE_PATH, chrome_arguments, prepare_profile
 from feed_extract import dedupe_permalinks, extract_embedded_permalinks
 
 FACEBOOK_HOSTS = {
@@ -321,13 +322,16 @@ def collect_page_links(
     seen_posts = set(seen_posts or ())
     results: list[dict[str, str]] = []
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
+        prepare_profile()
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_PATH),
             headless=not headed,
-            args=["--disable-notifications", "--mute-audio", "--no-first-run"],
+            args=chrome_arguments(),
+            viewport={"width": 1366, "height": 900},
+            locale="th-TH",
             **chromium_launch_options(playwright.chromium),
         )
-        context = browser.new_context(viewport={"width": 1366, "height": 900}, locale="th-TH")
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
         try:
             for index, page_url in enumerate(page_urls, start=1):
                 print(f"\n[*] เพจ {index}/{len(page_urls)}: {page_url}")
@@ -364,5 +368,4 @@ def collect_page_links(
                     time.sleep(random.randint(4, 8))
         finally:
             context.close()
-            browser.close()
     return results

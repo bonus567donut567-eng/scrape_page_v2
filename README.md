@@ -31,6 +31,10 @@ python -m playwright install chromium
 .\setup.ps1
 ```
 
+ขั้นตอนติดตั้งจะเปิด Chrome profile ของโปรเจกต์โดยอัตโนมัติ ให้ล็อกอิน Facebook
+แล้วกลับมากด Enter ใน PowerShell ระบบเก็บ session ไว้ใน `chrome-profile/` (ไม่ขึ้น Git)
+และจำกัด/ล้างเฉพาะ cache ที่สร้างใหม่ได้เมื่อเกิน 400 MB โดยไม่ลบ cookies หรือสถานะ login
+
 ถ้า `scrapIg` มี `client_secret.json` และ `token.json` อยู่แล้ว โปรแกรมจะใช้ไฟล์เดิมนั้น
 โดยอัตโนมัติโดยไม่คัดลอก secret เพิ่ม หากต้องการสร้าง token แยกสำหรับโปรเจกต์นี้:
 

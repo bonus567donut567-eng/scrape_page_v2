@@ -11,3 +11,4 @@ debug/
 client_secret.json
 token.json
 token.json.tmp
+chrome-profile/

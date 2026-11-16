@@ -10,10 +10,10 @@ import requests
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 from PIL import Image, UnidentifiedImageError
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.command import Command
+
+from chrome_profile import create_selenium_driver
 
 MIN_POST_IMAGE_PX = 200
 MIN_POST_CAPTION_CHARS = 20
@@ -505,39 +505,11 @@ def download_hd_image(img_url: str, save_image_path: str) -> bool:
 
 
 def init_driver(headless: bool = True, user_data_dir: str = ""):
-    chrome_options = Options()
-    if headless:
-        chrome_options.add_argument("--headless=new")
-    
-    # 🛡️ Flags ป้องกัน Tab Crash บน Facebook / SPA หน้าหนัก
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")      # บังคับใช้ RAM หลัก ไม่พึ่งพา shm
-    chrome_options.add_argument("--disable-notifications")
-    chrome_options.add_argument("--mute-audio")
-    chrome_options.add_argument("--window-size=1440,900")       # ลดความละเอียดจาก 1080p ลงมานิดหน่อย ประหยัดแรม
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--js-flags=--max-old-space-size=1024") # คุมเพดานหน่วยความจำ JS
-    
-    # ⚡ ปรับเป็น normal หรือใส่ timeout ชัดเจน เพื่อให้ DOM นิ่งก่อนเจาะข้อมูล
-    chrome_options.page_load_strategy = 'normal'
-    
-    # ซ่อน Automation
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option("useAutomationExtension", False)
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    profile_path = Path(user_data_dir).expanduser().resolve() if user_data_dir else None
+    driver = create_selenium_driver(
+        headless=headless,
+        **({"profile_path": profile_path} if profile_path else {}),
     )
-    if user_data_dir:
-        chrome_options.add_argument(
-            f"--user-data-dir={os.path.abspath(os.path.expanduser(user_data_dir))}"
-        )
-        chrome_options.add_argument("--profile-directory=Default")
-    
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.set_page_load_timeout(45)
-    driver.set_script_timeout(30)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
@@ -1580,8 +1552,9 @@ def scrape_fb_post_direct(
             )
 
     except Exception as e:
+        prefix = "browser_startup_failed: " if owns_driver and driver is None else "เกิดข้อผิดพลาด: "
         return _caption_result(
-            driver, post_url, False, "", f"เกิดข้อผิดพลาด: {str(e)}"
+            driver, post_url, False, "", f"{prefix}{str(e)}"
         )
     finally:
         if owns_driver and driver:

@@ -230,6 +230,9 @@ def process_pending_submissions(
                 directory for directory in posts_root.iterdir()
                 if directory.is_dir()
                 and (directory / "post.json").is_file()
+                and load_json(directory / "post.json", dict).get("status") == "success"
+                and (directory / "caption.txt").is_file()
+                and _find_image(directory) is not None
                 and not (directory / SUBMITTED_FLAG).is_file()
                 and not _is_terminal_failure(directory)
             ),
