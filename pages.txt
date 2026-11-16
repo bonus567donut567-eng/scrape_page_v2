@@ -1,0 +1,15 @@
+# ใส่ชื่อผู้ใช้เพจหรือ URL เต็ม หนึ่งเพจต่อหนึ่งบรรทัด
+# โปรแกรมจะทำตามลำดับจากบรรทัดบนลงล่าง
+# ตัวอย่าง:
+# IG.dara
+# https://www.facebook.com/example
+https://www.facebook.com/Marketing.in.th
+https://www.facebook.com/Pikatdara
+https://www.facebook.com/profile.php?id=100067669478426
+https://www.facebook.com/sabhang22
+https://www.facebook.com/Thaihotlive
+https://www.facebook.com/Marketing.in.th
+https://www.facebook.com/profile.php?id=61580297902104
+https://www.facebook.com/choasocial
+https://www.facebook.com/weektostronger
+https://www.facebook.com/Pikatdara
